@@ -1,0 +1,12 @@
+# quest database: kept locally, not redistributed (see README)
+tools/data/
+# never commit game data or personal exports
+WTF/
+SavedVariables/
+VanillaHelpersData/
+__pycache__/
+*.pyc
+*.bak
+*.zip
+.DS_Store
+Thumbs.db
