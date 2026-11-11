@@ -4,7 +4,7 @@
 -- Quest IDs use ClassicAPI.dll GetQuestIDForLogIndex() when available.
 -- Without WriteFile, the last snapshot is kept in SavedVariables (saved on logout or /reload).
 
-local VERSION = "1.0.0"
+local VERSION = "1.2.0"
 local SCHEMA = 3
 local PREFIX = "|cff66ccffOctoAI|r: "
 
@@ -973,17 +973,105 @@ frame:SetScript("OnEvent", function()
 end)
 
 ---------------------------------------------------------------------------
+-- Item tooltip cache: every item the player looks at is remembered (account wide,
+-- SavedVariables OctoAIItems). Lets an AI read exact stats of items you hovered
+-- in the auction house, at vendors, in chat links, loot rolls and so on.
+-- Entry format (one string, easy to parse): "<time>\n<itemId>\n<name>\n<tooltip line>\n..."
+---------------------------------------------------------------------------
+local ITEM_CAP, ITEM_PRUNE = 4000, 600
+local itemCount
+
+local function itemCache()
+  if type(OctoAIItems) ~= "table" then OctoAIItems = {} end
+  if type(OctoAIItems.items) ~= "table" then OctoAIItems.items = {} end
+  return OctoAIItems.items
+end
+
+local function pruneItems(items)
+  local list = {}
+  for k, v in pairs(items) do
+    local _, _, t = string.find(v, "^(%d+)")
+    table.insert(list, { k, tonumber(t) or 0 })
+  end
+  table.sort(list, function(a, b) return a[2] < b[2] end)
+  for i = 1, ITEM_PRUNE do
+    if list[i] then items[list[i][1]] = nil end
+  end
+  itemCount = table.getn(list) - ITEM_PRUNE
+end
+
+local function rememberTooltip(tt, link)
+  if not link or not tt or not tt.GetName then return end
+  local id, istr, lname = parseLink(link)
+  if not id then return end
+  local tname = tt:GetName()
+  if not tname then return end
+  local lines = {}
+  for i = 1, (tt:NumLines() or 0) do
+    local l = getglobal(tname .. "TextLeft" .. i)
+    local r = getglobal(tname .. "TextRight" .. i)
+    local lt = l and l:GetText()
+    local rt = r and r:IsShown() and r:GetText()
+    if lt and lt ~= "" then
+      if rt and rt ~= "" then lt = lt .. "  |  " .. rt end
+      table.insert(lines, strip(lt))
+    end
+  end
+  if table.getn(lines) == 0 then return end
+  local items = itemCache()
+  local key = istr or ("item:" .. id)
+  if not items[key] then
+    if not itemCount then
+      itemCount = 0
+      for _ in pairs(items) do itemCount = itemCount + 1 end
+    end
+    itemCount = itemCount + 1
+    if itemCount > ITEM_CAP then pruneItems(items) end
+  end
+  items[key] = time() .. "\n" .. id .. "\n" .. (lname or lines[1]) .. "\n" .. table.concat(lines, "\n")
+end
+
+local function hookTip(tt, method, linkFn)
+  if not tt then return end
+  local orig = tt[method]
+  if type(orig) ~= "function" then return end
+  tt[method] = function(self, a, b, c, d)
+    local r1, r2, r3 = orig(self, a, b, c, d)
+    local ok, link = pcall(linkFn, a, b, c, d)
+    if ok and link then pcall(rememberTooltip, self, link) end
+    return r1, r2, r3
+  end
+end
+
+local TIP_LINKS = {
+  SetHyperlink = function(a) return a end,
+  SetBagItem = function(a, b) return GetContainerItemLink(a, b) end,
+  SetInventoryItem = function(a, b) return GetInventoryItemLink(a, b) end,
+  SetAuctionItem = function(a, b) return GetAuctionItemLink(a, b) end,
+  SetMerchantItem = function(a) return GetMerchantItemLink(a) end,
+  SetLootItem = function(a) return GetLootSlotLink(a) end,
+  SetLootRollItem = function(a) return GetLootRollItemLink(a) end,
+  SetQuestItem = function(a, b) return GetQuestItemLink(a, b) end,
+  SetQuestLogItem = function(a, b) return GetQuestLogItemLink(a, b) end,
+  SetTradeSkillItem = function(a, b) if b then return GetTradeSkillReagentItemLink(a, b) end return GetTradeSkillItemLink(a) end,
+  SetCraftItem = function(a, b) if b then return GetCraftReagentItemLink(a, b) end return GetCraftItemLink(a) end,
+  SetTradePlayerItem = function(a) return GetTradePlayerItemLink(a) end,
+  SetTradeTargetItem = function(a) return GetTradeTargetItemLink(a) end,
+}
+for method, fn in pairs(TIP_LINKS) do hookTip(GameTooltip, method, fn) end
+hookTip(ItemRefTooltip, "SetHyperlink", TIP_LINKS.SetHyperlink)
+
+local function itemCacheCount()
+  local n = 0
+  for _ in pairs(itemCache()) do n = n + 1 end
+  return n
+end
+
+---------------------------------------------------------------------------
 -- /octoai: copyable plain-text summary for pasting into any AI chat
 ---------------------------------------------------------------------------
-local AI_HEADER = table.concat({
-  "[OctoWoW character export for an AI assistant (OctoAI addon)]",
-  "Server: OctoWoW, a private server running Turtle WoW 1.18.1 \"Mysteries of Azeroth\" content on the WoW 1.12 (vanilla) engine.",
-  "It has custom races, zones, quests, items and reworked talents. Retail/Classic data is often WRONG here.",
-  "Rules for the AI: use the data below as the truth about this character. For quests, NPCs and items look up",
-  "https://octowow.st/db/?quest=ID , ?npc=ID , ?item=ID (IDs are given in [brackets]) or the Turtle WoW wiki.",
-  "Do not fill gaps with retail/Classic data; say when something is a guess. Keep in-game names in English.",
-  "Coordinates are zone map percentages (x, y).",
-}, "\n")
+local AI_HEADER = "[OctoAI export. Server: OctoWoW = Turtle WoW 1.18.1 content on the 1.12 engine, with custom zones, quests, items and talents, so do not assume retail/Classic. "
+  .. "Treat this data as fact. Look up other things at octowow.st/db/?item=ID (or quest=, npc=) using the [IDs]. Say when you guess. Keep game names in English. Coords are zone map %.]"
 
 local SKIP_TIP = { "^Soulbound", "^Binds when", "^Binds to", "^Durability", "^Unique", "^Quest Item", "^<Right Click" }
 
@@ -997,7 +1085,7 @@ local function tipText(lines, skipFirst)
       if not skip then table.insert(out, l) end
     end
   end
-  return table.concat(out, "; ")
+  return (string.gsub(table.concat(out, "; "), "%s+", " "))
 end
 
 local function idTag(id) if id then return " [" .. id .. "]" end return "" end
@@ -1013,24 +1101,14 @@ local function aiCharacter(s, out)
   table.insert(out, string.format("XP %s/%s, rested %s, money %s", tostring(c.xp), tostring(c.xpMax), tostring(c.restedXP or 0), tostring(c.money)))
   if t.build then table.insert(out, "Talents: " .. t.build .. (t.unspent and t.unspent > 0 and (" (" .. t.unspent .. " unspent)") or "")) end
   local p = st.primary or {}
-  table.insert(out, string.format("Stats: Str %s Agi %s Sta %s Int %s Spi %s, Armor %s, AP %s, Ranged AP %s, Crit %s%%, Ranged crit %s%%",
+  local stats = string.format("Stats: Str %s Agi %s Sta %s Int %s Spi %s, Armor %s, AP %s, Ranged AP %s",
     tostring(p.Strength), tostring(p.Agility), tostring(p.Stamina), tostring(p.Intellect), tostring(p.Spirit), tostring(st.armor),
-    tostring(st.attackPower), tostring(st.rangedAttackPower), tostring(round(st.critChance or 0, 100)), tostring(round(st.rangedCritChance or 0, 100))))
+    tostring(st.attackPower), tostring(st.rangedAttackPower))
+  if st.critChance and st.critChance > 0 then stats = stats .. ", Crit " .. round(st.critChance, 100) .. "%" end
+  if st.rangedCritChance and st.rangedCritChance > 0 then stats = stats .. ", Ranged crit " .. round(st.rangedCritChance, 100) .. "%" end
+  table.insert(out, stats)
   if c.pet then
     table.insert(out, string.format("Pet: %s, level %s %s; %s", tostring(c.pet.name), tostring(c.pet.level), tostring(c.pet.family), table.concat(c.pet.spells or {}, ", ")))
-  end
-end
-
-local function aiTalents(s, out)
-  local t = s.talents
-  if not t or not t.trees then return end
-  table.insert(out, "== TALENTS ==")
-  for _, tree in ipairs(t.trees) do
-    local picked = {}
-    for _, tal in ipairs(tree.talents or {}) do
-      if tal.rank and tal.rank > 0 then table.insert(picked, tal.name .. " " .. tal.rank .. "/" .. tal.max) end
-    end
-    table.insert(out, string.format("%s (%s): %s", tostring(tree.name), tostring(tree.spent or 0), table.getn(picked) > 0 and table.concat(picked, ", ") or "-"))
   end
 end
 
@@ -1081,43 +1159,162 @@ local function aiBags(s, out)
   end
 end
 
-local function aiSkills(s, out)
-  table.insert(out, "== SKILLS ==")
-  local parts = {}
-  for _, sk in ipairs(s.skills or {}) do
-    if sk.max and sk.max > 1 then table.insert(parts, sk.name .. " " .. tostring(sk.rank) .. "/" .. tostring(sk.max)) end
-  end
-  table.insert(out, table.concat(parts, ", "))
-  for pname, P in pairs(s.professions or {}) do
-    local names = {}
-    for _, r in ipairs(P.recipes or {}) do
-      if r.difficulty ~= "trivial" then table.insert(names, tostring(r.name) .. (r.difficulty and (" (" .. r.difficulty .. ")") or "")) end
+local function aiTalents(s, out)
+  local t = s.talents
+  if not t or not t.trees then return end
+  table.insert(out, "== TALENTS (picked) ==")
+  for _, tree in ipairs(t.trees) do
+    local picked = {}
+    for _, tal in ipairs(tree.talents or {}) do
+      if tal.rank and tal.rank > 0 then table.insert(picked, tal.name .. " " .. tal.rank .. "/" .. tal.max) end
     end
-    table.insert(out, string.format("%s recipes that still give skill: %s", pname, table.getn(names) > 0 and table.concat(names, ", ") or "-"))
+    table.insert(out, string.format("%s (%s): %s", tostring(tree.name), tostring(tree.spent or 0), table.getn(picked) > 0 and table.concat(picked, ", ") or "-"))
   end
 end
 
+-- talent tooltip: drop name, rank line, tier-point requirement, "click to learn" and the next-rank block
+local function talentDesc(lines)
+  local out = {}
+  for i = 2, table.getn(lines or {}) do
+    local l = lines[i]
+    if string.find(l, "^Next [Rr]ank") then break end
+    if not (string.find(l, "^Rank %d") or string.find(l, "^Requires %d+ points") or string.find(l, "^Click to")) then
+      table.insert(out, l)
+    end
+  end
+  return (string.gsub(table.concat(out, " "), "%s+", " "))
+end
+
+local function aiTalentsFull(s, out)
+  local t = s.talents
+  if not t or not t.trees then return end
+  table.insert(out, "== TALENT TREES (tier: name rank/max: effect) ==")
+  for _, tree in ipairs(t.trees) do
+    table.insert(out, string.format("-- %s (%s points)", tostring(tree.name), tostring(tree.spent or 0)))
+    local byPos = {}
+    for _, tal in ipairs(tree.talents or {}) do byPos[(tal.tier or 0) .. ":" .. (tal.col or 0)] = tal.name end
+    for _, tal in ipairs(tree.talents or {}) do
+      local req = ""
+      if tal.requires then req = " [needs " .. tostring(byPos[tal.requires.tier .. ":" .. tal.requires.col]) .. "]" end
+      table.insert(out, string.format("T%s %s %s/%s%s: %s", tostring(tal.tier), tostring(tal.name), tostring(tal.rank), tostring(tal.max), req, talentDesc(tal.tooltip)))
+    end
+  end
+end
+
+local function skillLevels(s, cats)
+  local parts = {}
+  for _, sk in ipairs(s.skills or {}) do
+    if cats[sk.category or ""] and sk.max and sk.max > 1 then
+      table.insert(parts, sk.name .. " " .. tostring(sk.rank) .. "/" .. tostring(sk.max))
+    end
+  end
+  return table.concat(parts, ", ")
+end
+
+local function aiSpells(s, out)
+  table.insert(out, "== SPELLS AND ABILITIES ==")
+  table.insert(out, "Weapon/armor skills: " .. skillLevels(s, { ["Weapon Skills"] = true, ["Armor Proficiencies"] = true, ["Class Skills"] = true }))
+  for _, tab in ipairs(s.spells or {}) do
+    table.insert(out, "-- " .. tostring(tab.tab))
+    local d = tab.details or {}
+    for _, entry in ipairs(tab.spells or {}) do
+      local _, _, base = string.find(entry, "^(.-) %(")
+      local lines = d[base or entry] or d[entry]
+      table.insert(out, entry .. ": " .. (lines and tipText(lines, true) or ""))
+    end
+  end
+  local c = s.character or {}
+  if c.pet and c.pet.spells then table.insert(out, "Pet abilities: " .. table.concat(c.pet.spells, ", ")) end
+  local bt = s.professions and s.professions["Beast Training"]
+  if bt and bt.recipes then
+    local names = {}
+    local seen = {}
+    for _, r in ipairs(bt.recipes) do
+      local n = tostring(r.name) .. (r.rank and (" (" .. r.rank .. ")") or "")
+      if not seen[n] then seen[n] = true; table.insert(names, n) end
+    end
+    table.insert(out, "Beast Training (pet abilities the hunter can teach): " .. table.concat(names, ", "))
+  end
+end
+
+local function aiProfessions(s, out)
+  table.insert(out, "== PROFESSIONS ==")
+  table.insert(out, "Levels: " .. skillLevels(s, { ["Professions"] = true, ["Secondary Skills"] = true }))
+  table.insert(out, "Recipe difficulty: optimal=orange, medium=yellow, easy=green (skill-ups); grey recipes listed by name only.")
+  for pname, P in pairs(s.professions or {}) do
+   if pname ~= "Beast Training" then
+    table.insert(out, string.format("-- %s %s/%s (recipes as of %s)", tostring(pname), tostring(P.rank), tostring(P.max), tostring(P.scannedAt)))
+    local grey = {}
+    for _, r in ipairs(P.recipes or {}) do
+      if r.difficulty == "trivial" then
+        table.insert(grey, tostring(r.name))
+      else
+        local rg = {}
+        for _, g in ipairs(r.reagents or {}) do table.insert(rg, tostring(g.name) .. " x" .. tostring(g.count)) end
+        local extra = ""
+        if r.made then extra = extra .. ", makes " .. r.made end
+        if r.readyAt then extra = extra .. ", cooldown until " .. r.readyAt end
+        table.insert(out, string.format("%s%s (%s): %s%s", tostring(r.name), idTag(r.itemId), tostring(r.difficulty), table.concat(rg, ", "), extra))
+      end
+    end
+    if table.getn(grey) > 0 then table.insert(out, "Grey: " .. table.concat(grey, ", ")) end
+   end
+  end
+end
+
+local function aiTrainers(s, out)
+  if not s.trainers then return end
+  table.insert(out, "== TRAINERS: NOT YET LEARNED ==")
+  for tname, T in pairs(s.trainers) do
+    local parts = {}
+    for _, sv in ipairs(T.services or {}) do
+      if sv.status ~= "used" then
+        local p = tostring(sv.name) .. (sv.rank and (" (" .. sv.rank .. ")") or "")
+        local req = {}
+        if sv.reqLevel then table.insert(req, "lvl " .. sv.reqLevel) end
+        if sv.requires then table.insert(req, sv.requires) end
+        if sv.costCopper then table.insert(req, string.format("%.2fg", sv.costCopper / 10000)) end
+        if table.getn(req) > 0 then p = p .. " [" .. table.concat(req, ", ") .. "]" end
+        table.insert(parts, p)
+      end
+    end
+    if table.getn(parts) > 0 then table.insert(out, tostring(tname) .. ": " .. table.concat(parts, "; ")) end
+  end
+end
+
+local function aiReputation(s, out)
+  local parts = {}
+  for _, r in ipairs(s.reputation or {}) do
+    table.insert(parts, tostring(r.name) .. " " .. tostring(r.standing) .. (r.progress and (" " .. r.progress) or ""))
+  end
+  if table.getn(parts) > 0 then
+    table.insert(out, "== REPUTATION ==")
+    table.insert(out, table.concat(parts, ", "))
+  end
+  if s.buffs and table.getn(s.buffs) > 0 then table.insert(out, "Buffs: " .. table.concat(s.buffs, ", ")) end
+end
+
 local AI_PARTS = {
-  default = { aiCharacter, aiTalents, aiGear, aiQuests },
-  gear = { aiCharacter, aiGear },
-  quests = { aiCharacter, aiQuests },
-  bags = { aiCharacter, aiBags },
-  talents = { aiCharacter, aiTalents },
-  skills = { aiCharacter, aiSkills },
-  all = { aiCharacter, aiTalents, aiGear, aiQuests, aiBags, aiSkills },
+  default = { aiCharacter, aiTalents, aiGear, aiQuests, aiBags },
+  gear = { aiCharacter, aiGear, aiBags },
+  quests = { aiCharacter, aiQuests, aiBags },
+  talents = { aiCharacter, aiTalentsFull },
+  spells = { aiCharacter, aiSpells },
+  professions = { aiCharacter, aiProfessions, aiBags },
+  all = { aiCharacter, aiTalentsFull, aiSpells, aiGear, aiQuests, aiBags, aiProfessions, aiTrainers, aiReputation },
 }
 
 local aiFrame, aiEdit, aiText, aiCurrent
 local openAI
 local AI_TABS = {
-  { "default", "Summary" }, { "gear", "Gear" }, { "quests", "Quests" }, { "bags", "Bags" },
-  { "talents", "Talents" }, { "skills", "Skills" }, { "all", "All" },
+  { "default", "Summary" }, { "gear", "Gear" }, { "quests", "Quests" },
+  { "talents", "Talents" }, { "spells", "Spells" }, { "professions", "Professions" }, { "all", "All" },
 }
 local aiTabButtons = {}
 local function showAIText(text)
   if not aiFrame then
     aiFrame = CreateFrame("Frame", "OctoAIFrame", UIParent)
-    aiFrame:SetWidth(620); aiFrame:SetHeight(470)
+    aiFrame:SetWidth(670); aiFrame:SetHeight(500)
     aiFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 40)
     aiFrame:SetFrameStrata("DIALOG")
     aiFrame:SetBackdrop({ bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -1137,7 +1334,7 @@ local function showAIText(text)
     for i, tab in ipairs(AI_TABS) do
       local key = tab[1]
       local b = CreateFrame("Button", "OctoAITab" .. i, aiFrame, "UIPanelButtonTemplate")
-      b:SetWidth(78); b:SetHeight(22)
+      b:SetWidth(86); b:SetHeight(22)
       if prev then b:SetPoint("LEFT", prev, "RIGHT", 2, 0) else b:SetPoint("TOPLEFT", aiFrame, "TOPLEFT", 22, -36) end
       b:SetText(tab[2])
       b:SetScript("OnClick", function() openAI(key) end)
@@ -1154,7 +1351,7 @@ local function showAIText(text)
     aiEdit:SetMaxLetters(0)
     aiEdit:SetAutoFocus(false)
     aiEdit:SetFontObject(ChatFontNormal)
-    aiEdit:SetWidth(550); aiEdit:SetHeight(345)
+    aiEdit:SetWidth(600); aiEdit:SetHeight(375)
     aiEdit:SetScript("OnEscapePressed", function() aiFrame:Hide() end)
     -- read-only: undo any typing, keep the text selected
     aiEdit:SetScript("OnTextChanged", function()
@@ -1219,16 +1416,18 @@ end
 openAI = function(arg)
   arg = string.lower(arg or "")
   if arg == "" then arg = "default" end
+  if arg == "skills" then arg = "professions" end
+  if arg == "bags" then arg = "default" end
   local parts = AI_PARTS[arg]
   if not parts then
-    msg("/octoai [gear|quests|bags|talents|skills|all]  (no argument = character, talents, gear and quests)")
+    msg("/octoai [gear|quests|talents|spells|professions|all]  (no argument = summary)")
     return
   end
   if UnitAffectingCombat("player") then msg("not in combat, please"); return end
   aiCurrent = arg
   local ok, snap = pcall(buildSnapshot, "octoai", false)
   if not ok then msg("|cffff5555failed:|r " .. tostring(snap)); return end
-  local out = { AI_HEADER, "Exported: " .. tostring(snap.exportedAt), "" }
+  local out = { AI_HEADER, "Exported " .. tostring(snap.exportedAt), "" }
   for _, fn in ipairs(parts) do
     local ok2, err = pcall(fn, snap, out)
     if not ok2 then table.insert(out, "(section failed: " .. tostring(err) .. ")") end
@@ -1274,13 +1473,14 @@ SlashCmdList["OCTOEXPORT"] = function(input)
       .. ", WriteFile " .. (type(WriteFile) == "function" and "available" or "MISSING")
       .. ", quest IDs " .. (hasQuestIDs() and "ClassicAPI" or "none")
       .. ", professions " .. (function() local n = 0; for _ in pairs(db.professions or {}) do n = n + 1 end; return n end)()
+      .. ", items cached " .. itemCacheCount()
       .. ", last export " .. tostring(db.lastExport) .. (db.lastMs and string.format(" (%d ms)", db.lastMs) or ""))
   else
     msg("/octo  - export now")
     msg("/octo auto on|off  - auto export on changes (default on)")
     msg("/octo verbose  - show a chat line on every auto export")
     msg("/octo status")
-    msg("/octoai [gear|quests|bags|talents|skills|all]  - copyable text for any AI chat")
+    msg("/octoai [gear|quests|talents|spells|professions|all]  - copyable text for any AI chat")
     msg("professions: open a profession window once; recipes are saved and exported automatically")
   end
 end

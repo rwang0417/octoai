@@ -12,7 +12,7 @@ OctoWoW is a vanilla-style private server running Turtle WoW's "Mysteries of Aze
 - WoW folder on the user's computer: the folder that contains WoW.exe (for example `D:\WoW`). It must be connected to the session; in the shell it is usually mounted as `$HOME/mnt/<folder name>`. Run `ls $HOME/mnt/` to find it.
 - Tool: `<WoW folder>\Interface\AddOns\OctoAI\tools\octo_query.py` with the quest database in `tools\data`. Run it as `python3 "$HOME/mnt/<folder name>/Interface/AddOns/OctoAI/tools/octo_query.py" <command>`; snapshots are found automatically.
 - Snapshots: written by the OctoAI addon to `WTF\Account\<account>\<realm>\<character>\SavedVariables\OctoAI.lua` (updated on logout or /reload), or to `VanillaHelpersData\octo_<Name>.json` if the VanillaHelpers DLL is installed.
-- If `tools\data` is missing, database commands stop with a hint. Run `python3 .../tools/update_data.py` once (it downloads the database from GitHub); if the shell has no network, ask the user to run `python tools\update_data.py` in the OctoAI folder. Character commands work without it.
+- If `tools\data` is missing, database commands stop with a hint. Run `python3 .../tools/update_data.py` once (it downloads the database from GitHub); if the shell has no network, ask the user to run `python tools\update_data.py` in the OctoAI folder. Character commands (`list`, `char`, `talents`) work without it.
 - If the WoW folder is not reachable, ask the user to connect it ("Add folder"). Users without a connected folder can paste the text from `/octoai` instead; treat that text as `[snapshot]`.
 
 ## Hard rules
@@ -43,6 +43,7 @@ The tool finds character snapshots automatically. If the user uploads a snapshot
 | `zone NAME [--level N] [--faction A\|H] [--class CLASS]` | quests that start in a zone, filtered for the character |
 | `service TYPE [--zone Z]` | flight, innkeeper, vendor, repair, banker, auctioneer, stablemaster, mailbox, rares, herbs, mines, chests ... |
 | `search TEXT` | fuzzy search across quests, NPCs, objects, items, zones |
+| `seen ID\|NAME` | full tooltip (exact stats) of any item the player hovered in game: auction house, vendor, chat link, loot. Use this first for "is item X worth it?" |
 | `events` | holiday calendar |
 
 Add `--char NAME` to database commands so results are filtered for that character's faction, class, level and position (default: the most recent snapshot). `--snap` and `--wow` work with every command.
@@ -76,6 +77,7 @@ Do NOT use Wowhead, Icy Veins, Warcraft wiki, or retail/Classic guides for OctoW
 ## Items and gear
 
 - Equipped and bagged gear include full tooltip text in the snapshot `[snapshot]`; that is authoritative.
+- For items the player does not own, run `seen <name or ID>` first: the addon caches tooltips of everything the player hovered. If it is not there, ask the player to hover it in game and /reload.
 - OctoQuestDatabase has no item stats. For other items, start with `https://octowow.st/db/?item=<ID>`; otherwise say the stats are unverified.
 - "Reinforced Armor", "Weapon Damage +N" and similar lines are Turtle enchants; keep them in comparisons.
 

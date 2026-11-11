@@ -17,6 +17,7 @@ Commands (all output is plain text meant to be read by an AI)
   zone NAME [--level N] [--faction A|H] [--class CLASS]   quests that start in a zone
   service TYPE [--zone Z] [--faction A|H]   flight|innkeeper|vendor|repair|banker|auctioneer|stablemaster|mailbox|...
   search TEXT                 search names of quests, NPCs, objects, items, zones
+  seen ID|NAME                full tooltip (stats) of items the player hovered in game (OctoAI item cache)
   events                      holiday / event calendar
   list                        list exported characters
 
@@ -29,6 +30,7 @@ import glob
 import json
 import math
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -247,7 +249,10 @@ def player_context(snap):
     ctx["zone"] = c.get("zone")
     ctx["coords"] = c.get("coords")
     if ctx["zone"]:
-        ctx["zid"] = find_zone_id(ctx["zone"])
+        try:
+            ctx["zid"] = find_zone_id(ctx["zone"])
+        except SystemExit:  # quest database not downloaded: character commands still work
+            ctx["zid"] = None
     return ctx
 
 
@@ -653,6 +658,54 @@ def cmd_search(args, ctx):
     return "\n".join(out) or "nothing found"
 
 
+def item_cache_files():
+    out = []
+    for w in wow_dirs():
+        out += glob.glob(os.path.join(w, "WTF", "Account", "*", "SavedVariables", "OctoAI.lua"))
+    return out
+
+
+def load_item_cache():
+    """{key: (time, itemId, name, [tooltip lines])} from OctoAIItems (account-wide SavedVariables)."""
+    items = {}
+    for f in item_cache_files():
+        with open(f, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+        for m in re.finditer(r'\["(item:[^"]+)"\]\s*=\s*"((?:[^"\\]|\\.)*)"', text):
+            v = _lua_unescape(m.group(2)).split("\n")
+            if len(v) < 4 or not v[0].isdigit() or not v[1].isdigit():
+                continue
+            ts, iid = int(v[0]), int(v[1])
+            prev = items.get(m.group(1))
+            if prev and prev[0] >= ts:
+                continue
+            items[m.group(1)] = (ts, iid, v[2], v[3:])
+    return items
+
+
+def cmd_seen(args, ctx):
+    items = load_item_cache()
+    if not items:
+        return ("No item tooltips cached yet. In game (OctoAI 1.1.0+), hover the item once (auction house, vendor, "
+                "chat link, loot, bags), then /reload so the cache is written.")
+    q = args.query.strip().lower()
+    hits = []
+    for key, (ts, iid, name, lines) in items.items():
+        if (q.isdigit() and int(q) == iid) or (not q.isdigit() and q in name.lower()):
+            hits.append((ts, key, iid, name, lines))
+    if not hits:
+        return "No cached tooltip matches '%s' (%d items cached). Hover it in game, then /reload." % (args.query, len(items))
+    hits.sort(reverse=True)
+    out = []
+    for ts, key, iid, name, lines in hits[:15]:
+        when = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        out.append("ITEM %s [item %d] (tooltip seen in game %s, %s)" % (name, iid, when, key))
+        out.append("  " + "; ".join(lines))
+    if len(hits) > 15:
+        out.append("... %d more matches, refine the name" % (len(hits) - 15))
+    return "\n".join(out)
+
+
 def cmd_events(args, ctx):
     rules = load("supplemental")["calendarRules"]
     lines = ["Event calendar (month/day):"]
@@ -878,6 +931,7 @@ def main(argv=None):
     s.add_argument("--faction"); s.add_argument("--class", dest="cls"); s.add_argument("--limit", type=int, default=60)
     s = sub.add_parser("service"); s.add_argument("type"); s.add_argument("--zone", nargs="+"); s.add_argument("--faction")
     s = sub.add_parser("search"); s.add_argument("text", nargs="+")
+    s = sub.add_parser("seen"); s.add_argument("query", nargs="+")
     sub.add_parser("events")
     sub.add_parser("list")
     try:
@@ -910,7 +964,7 @@ def main(argv=None):
 
     fn = {"char": cmd_char, "talents": cmd_talents, "myquests": cmd_myquests, "quest": cmd_quest, "npc": cmd_npc,
           "object": cmd_object, "item": cmd_item, "zone": cmd_zone, "service": cmd_service, "search": cmd_search,
-          "events": cmd_events, "list": cmd_list}[args.cmd]
+          "events": cmd_events, "list": cmd_list, "seen": cmd_seen}[args.cmd]
     out = fn(args, ctx)
     try:
         sys.stdout.reconfigure(encoding="utf-8")
